@@ -15,6 +15,7 @@ import pickle
 import shutil
 import sys
 import subprocess
+import struct
 import tempfile
 import textwrap
 import threading
@@ -5656,7 +5657,7 @@ class UserInterface():  # Separate view (curses) from this controller
     def save(self):
         self.clearStatusLine()
         self.move(self.mov.sizeY, 0)
-        self.promptPrint("File format? [D]UR, [A]NSI, A[N]SIMATION, ASCI[I], [M]IRC, [J]SON, [H]TML, [P]NG, [G]IF: ")
+        self.promptPrint("File format? [D]UR, [A]NSI, A[N]SIMATION, [B]IN32, ASCI[I], [M]IRC, [J]SON, [H]TML, [P]NG, [G]IF: ")
         self.stdscr.nodelay(0) # do not wait for input when calling getch
         prompting = True
         saved = False
@@ -5668,6 +5669,9 @@ class UserInterface():  # Separate view (curses) from this controller
                 prompting = False
             elif c in [100, 68]: # 100 = d = dur, 68 = D
                 saveFormat = 'dur'
+                prompting = False
+            elif c in [98, 66]: # 98 = b = bin32, 66 = B
+                saveFormat = 'bin32'
                 prompting = False
             elif c in [106, 74]:  # 106 = j, 74 = J
                 saveFormat = 'json'
@@ -5847,6 +5851,8 @@ class UserInterface():  # Separate view (curses) from this controller
             saved = self.saveDur2File(filename, gzipped=False)
         if saveFormat == 'html':   # dur2 = serialized json, plaintext
             saved = self.saveHtmlFile(filename, gzipped=False)
+        if saveFormat == 'bin32':  # binary, 4 bytes per cell
+            saved = self.saveBin32File(filename)
         if saveFormat == 'ansi':  # ansi = escape codes for colors+ascii
             saved = self.saveAnsiFile(filename, encoding=encoding)
         if saveFormat == 'ansimation':  # ansi = escape codes for colors+ascii
@@ -5887,6 +5893,46 @@ class UserInterface():  # Separate view (curses) from this controller
             return False
         f.close()
         durfile.write_frame_to_html_file(self.mov, self.appState, self.mov.currentFrame, filename, gzipped=gzipped)
+        return True
+
+    def saveBin32File(self, filename):
+        """Writes 4-byte-per-cell binary files (2-byte codepoint, 1-byte fg, 1-byte bg)."""
+        def frame_filename(base_name, ext, index):
+            if ext:
+                return f"{base_name}-{index}{ext}"
+            else:
+                return f"{base_name}-{index}"
+
+        def write_frame(frame, out_path):
+            nonlocal truncated
+            try:
+                with open(out_path, 'wb') as f:
+                    for y in range(self.mov.sizeY):
+                        for x in range(self.mov.sizeX):
+                            char = frame.content[y][x]
+                            codepoint = ord(char[0]) if char else 0
+                            if codepoint > 0xFFFF:
+                                codepoint = 0xFFFF
+                                truncated = True
+                            fg, bg = frame.newColorMap[y][x]
+                            f.write(struct.pack('<HBB', codepoint, fg & 0xFF, bg & 0xFF))
+                return True
+            except Exception as e:
+                self.notify(f"Error saving BIN32 file ({out_path}): {e}")
+                return False
+
+        truncated = False
+        base_name, ext = os.path.splitext(filename)
+        if self.mov.frameCount > 1:
+            for idx, frame in enumerate(self.mov.frames, start=1):
+                out_path = frame_filename(base_name, ext, idx)
+                if not write_frame(frame, out_path):
+                    return False
+        else:
+            if not write_frame(self.mov.currentFrame, filename):
+                return False
+        if truncated:
+            self.notify("Warning: Some characters exceeded 0xFFFF and were truncated in BIN32 output.", pause=False)
         return True
 
     def saveDur2File(self, filename, gzipped=True):
@@ -7236,6 +7282,5 @@ Can use ESC or META instead of ALT
                 self.appState.durview_running = False
             else:
                 self.enterViewMode()
-
 
 
