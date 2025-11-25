@@ -6264,7 +6264,10 @@ class UserInterface():  # Separate view (curses) from this controller
         return 1 # blank frame, only save the first line.
 
     def savePngFile(self, filename, lastLineNum=None, firstLineNum=None, firstColNum=None, lastColNum=None, font='ansi'):
-        """ Save to ANSI then convert to PNG """
+        """ Save to PNG. Use native renderer for 256c, ansilove for 16c. """
+        if self.appState.colorMode == "256":
+            return self.savePngFile_native256(filename, lastLineNum=lastLineNum, firstLineNum=firstLineNum, firstColNum=firstColNum, lastColNum=lastColNum)
+        # 16c path: use ansilove
         if not self.appState.isAppAvail("ansilove"):   # ansilove not found
             self.notify("Ansilove not found in path. Please find it at https://www.ansilove.org/", pause=True)
             return False
@@ -6319,6 +6322,145 @@ class UserInterface():  # Separate view (curses) from this controller
             return False
         os.remove(tmpPngFileName)
         return True
+
+    def savePngFile_native256(self, filename, lastLineNum=None, firstLineNum=None, firstColNum=None, lastColNum=None):
+        """Render current frame to PNG using xterm-256 palette, bypassing ansilove."""
+        try:
+            from PIL import Image, ImageDraw, ImageFont
+        except ImportError:
+            self.notify("Error: PNG export requires the Pillow module for Python.", pause=True)
+            return False
+        atlas_path = pathlib.Path(__file__).parent.joinpath("charsets/TrimAtlas.png")
+        atlas_meta_path = pathlib.Path(__file__).parent.joinpath("charsets/TrimAtlas.json")
+        use_atlas = atlas_path.exists() and atlas_meta_path.exists()
+        atlas = None
+        atlas_meta = None
+        if use_atlas:
+            try:
+                import json
+                atlas = Image.open(atlas_path).convert("RGBA")
+                atlas_meta = json.loads(atlas_meta_path.read_text())
+                glyph_w, glyph_h = map(int, atlas_meta["glyph_size"].split("x"))
+                chars_per_row = int(atlas_meta["chars_per_row"])
+                ranges = atlas_meta["sequential_ranges"]
+            except Exception:
+                use_atlas = False
+
+        # Determine bounds (default to full canvas)
+        frame = self.mov.currentFrame
+        if not frame or not frame.content:
+            self.notify("Error: No frame data to export.", pause=True)
+            return False
+        if firstLineNum is None:
+            firstLineNum = 0
+        if firstColNum is None:
+            firstColNum = 0
+        if lastLineNum is None:
+            lastLineNum = frame.sizeY
+        if lastColNum is None:
+            lastColNum = frame.sizeX
+
+        # Font setup or atlas glyph size
+        if use_atlas:
+            cell_w = glyph_w
+            cell_h = glyph_h
+            font = None
+        else:
+            font = None
+            font_candidates = [
+                ("/System/Library/Fonts/Menlo.ttc", 14),
+                ("/Library/Fonts/Menlo.ttc", 14),
+                ("/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf", 14),
+                ("/usr/share/fonts/truetype/liberation/LiberationMono-Regular.ttf", 14),
+            ]
+            for path, size in font_candidates:
+                try:
+                    font = ImageFont.truetype(path, size)
+                    break
+                except Exception:
+                    continue
+            if font is None:
+                font = ImageFont.load_default()
+            bbox = font.getbbox("M")
+            cell_w = max(bbox[2] - bbox[0], 8)
+            cell_h = max(bbox[3] - bbox[1], 16)
+
+        width_chars = max(1, lastColNum - firstColNum)
+        height_chars = max(1, lastLineNum - firstLineNum)
+        img = Image.new("RGBA", (width_chars * cell_w, height_chars * cell_h), (0, 0, 0, 255))
+        draw = ImageDraw.Draw(img)
+
+        def xterm_color(idx: int):
+            idx = int(max(0, min(255, idx)))
+            if idx < 16:
+                table = [
+                    (0, 0, 0), (205, 0, 0), (0, 205, 0), (205, 205, 0),
+                    (0, 0, 238), (205, 0, 205), (0, 205, 205), (229, 229, 229),
+                    (127, 127, 127), (255, 0, 0), (0, 255, 0), (255, 255, 0),
+                    (92, 92, 255), (255, 0, 255), (0, 255, 255), (255, 255, 255)
+                ]
+                return table[idx]
+            if 16 <= idx <= 231:
+                idx -= 16
+                r = (idx // 36) % 6
+                g = (idx // 6) % 6
+                b = idx % 6
+                return (55 + r * 40 if r else 0,
+                        55 + g * 40 if g else 0,
+                        55 + b * 40 if b else 0)
+            level = 8 + (idx - 232) * 10
+            return (level, level, level)
+
+        for y in range(firstLineNum, lastLineNum):
+            for x in range(firstColNum, lastColNum):
+                try:
+                    char = frame.content[y][x]
+                    fg, bg = frame.newColorMap[y][x]
+                except IndexError:
+                    continue
+                # background
+                bg_rgb = xterm_color(bg)
+                draw.rectangle(
+                    [((x - firstColNum) * cell_w, (y - firstLineNum) * cell_h),
+                     ((x - firstColNum + 1) * cell_w, (y - firstLineNum + 1) * cell_h)],
+                    fill=bg_rgb
+                )
+                # foreground char
+                fg_rgb = xterm_color(fg)
+                if use_atlas:
+                    codepoint = ord(char)
+                    atlas_index = None
+                    offset = 0
+                    for r in ranges:
+                        start = int(r["start"], 16)
+                        end = int(r["end"], 16)
+                        if codepoint >= start and codepoint <= end:
+                            atlas_index = r["atlas_offset"] + (codepoint - start)
+                            break
+                        offset += (int(r["end"], 16) - int(r["start"], 16) + 1)
+                    if atlas_index is not None:
+                        row = atlas_index // chars_per_row
+                        col = atlas_index % chars_per_row
+                        src_box = (col * glyph_w, row * glyph_h, (col + 1) * glyph_w, (row + 1) * glyph_h)
+                        glyph_img = atlas.crop(src_box)
+                        # tint foreground by applying alpha as mask to fg color
+                        alpha = glyph_img.split()[-1]
+                        tinted = Image.new("RGBA", (glyph_w, glyph_h), fg_rgb + (0,))
+                        tinted.putalpha(alpha)
+                        img.alpha_composite(tinted, dest=((x - firstColNum) * cell_w, (y - firstLineNum) * cell_h))
+                    else:
+                        draw.text(((x - firstColNum) * cell_w, (y - firstLineNum) * cell_h),
+                                  char, fill=fg_rgb, font=font)
+                else:
+                    draw.text(((x - firstColNum) * cell_w, (y - firstLineNum) * cell_h),
+                              char, fill=fg_rgb, font=font)
+
+        try:
+            img.save(filename, "PNG")
+            return True
+        except Exception as e:
+            self.notify(f"Error saving PNG: {e}", pause=True)
+            return False
 
 
     def saveGifFile(self, filename, font="ansi"):
