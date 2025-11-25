@@ -291,6 +291,14 @@ class ColorPicker:
             self.hide()
         return color
 
+    def showBgPicker(self, message=None):
+        """ Background picker (256-mode) """
+        self.hidden = False
+        color = self.handler.showColorPicker(type="bg", message=message)
+        if not self.caller.appState.sideBarShowing:
+            self.hide()
+        return color
+
     def hide(self):
         self.hidden = True
         self.handler.hide()
@@ -433,6 +441,8 @@ class StatusBar():
         settingsMenu.add_item("Toggle Mouse", caller.toggleMouse, "m")
         settingsMenu.add_item("Toggle Color Scroll", caller.toggleColorScrolling, "s")
         settingsMenu.add_item("Toggle Wide Wrapping", caller.toggleWideWrapping, "w")
+        settingsMenu.add_item("Enable 256 BG Colors", caller.toggleBgInjection, "b")
+        settingsMenu.add_item("Pick BG Color (256)", caller.selectBgColorPicker, "g")
         if self.appState.mental:    # Experimental stuff
             settingsMenu.add_item("Toggle iCE Colors (MENTAL)", caller.toggleIceColors, "i")
             settingsMenu.add_item("Toggle Injecting (MENTAL)", caller.toggleInjecting, "j")
@@ -751,7 +761,5 @@ class StatusBar():
         for item in self.items:
             if item.hidden is False:
                 item.handler.draw(plusX=self.x, plusY=self.y)
-
-
 
 

@@ -65,6 +65,7 @@ class AppState():
 
         # Other durdraw runtime stuff
         self.can_inject = False # Allow injecting color codes to override ncurses colors (for BG 256 colors)
+        self.bg_inject_enabled = False  # Enable 256-color backgrounds via ANSI injection
         self.sleep_time = 0     # Use this as a delay for playback mode, dictated in ui_curses.py from FPS
         self.showBgColorPicker = False # until BG colors work in 256 color mode. (ncurses 5 color pair limits)
         self.scrollColors = False   # When true, scroll wheel in canvas changes color instead of moving cursor
@@ -432,6 +433,5 @@ class AppState():
         #    self.hasHelpFile = False
         #    self.helpMov = None
         #    return False
-
 
 

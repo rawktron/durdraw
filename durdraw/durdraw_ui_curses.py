@@ -486,16 +486,23 @@ class UserInterface():  # Separate view (curses) from this controller
         try:
             self.colorpair = self.ansi.colorPairMap[(self.colorfg, self.colorbg)] 
         except KeyError:
-            try:    # If we're trying to use an unreigstered color pair, strip
-                    # out the background and try again.
-                self.colorbg = 0
-                self.colorpair = self.ansi.colorPairMap[(self.colorfg, self.colorbg)] 
-            except KeyError:
-                self.notify(f"There was an error setting the color. fg: {self.colorfg}, bg: {self.colorbg}. Please file a bug report explaining how you got to this error.")
+            if self.appState.colorMode == "256" and (self.appState.bg_inject_enabled or self.appState.can_inject):
+                # Keep BG; we'll inject if needed
+                self.colorpair = self.ansi.colorPairMap.get((self.colorfg, 0), 0)
+            else:
+                try:    # If we're trying to use an unreigstered color pair, strip
+                        # out the background and try again.
+                    self.colorbg = 0
+                    self.colorpair = self.ansi.colorPairMap[(self.colorfg, self.colorbg)] 
+                except KeyError:
+                    self.notify(f"There was an error setting the color. fg: {self.colorfg}, bg: {self.colorbg}. Please file a bug report explaining how you got to this error.")
 
     def setBgColor(self, bg):
         self.colorbg = bg
-        self.colorpair = self.ansi.colorPairMap[(self.colorfg, self.colorbg)] 
+        try:
+            self.colorpair = self.ansi.colorPairMap[(self.colorfg, self.colorbg)] 
+        except KeyError:
+            self.colorpair = self.ansi.colorPairMap.get((self.colorfg, 0), 0)
 
     def switchTo16ColorMode(self):
         self.switchToColorMode("16")
@@ -980,6 +987,16 @@ class UserInterface():  # Separate view (curses) from this controller
         else:
             self.appState.wrapWidth = 80
         self.notify(f"Line wrapping for loading ANSIs set to: {self.appState.wrapWidth}")
+
+    def toggleBgInjection(self):
+        self.appState.bg_inject_enabled = not self.appState.bg_inject_enabled
+        # enable ANSI injection path for backgrounds
+        if self.appState.bg_inject_enabled:
+            self.appState.can_inject = True
+            self.appState.showBgColorPicker = True
+            self.notify("256 BG colors enabled (ANSI inject).", pause=False)
+        else:
+            self.notify("256 BG colors disabled.", pause=False)
 
     def toggleInjecting(self):
         self.appState.can_inject = not self.appState.can_inject
@@ -1924,10 +1941,13 @@ class UserInterface():  # Separate view (curses) from this controller
                         # don't do curses.nonl())
                     elif c in [263, 127]:              # backspace
                         self.backspace()
-                    elif c in [9, 353]:     # 9 = tab, 353 = shift-tab
-                        #if self.appState.colorMode == "256":
-                        #    self.statusBar.colorPickerButton.on_click()
+                    elif c == 9:     # tab -> fg picker
                         self.statusBar.colorPickerButton.on_click()
+                    elif c == 353:   # shift-tab -> bg picker if available
+                        if self.appState.colorMode == "256" and (self.appState.bg_inject_enabled or self.appState.can_inject):
+                            self.selectBgColorPicker()
+                        else:
+                            self.statusBar.colorPickerButton.on_click()
                     elif c in [330]:              # delete
                         self.deleteKeyPop(frange=self.appState.playbackRange)
                     elif c in [383]:              # shift-delete - delete from opposite direction
@@ -2209,6 +2229,14 @@ class UserInterface():  # Separate view (curses) from this controller
     def drawStatusBar(self):
         if self.statusBar.hidden:
             return False
+        # Ensure terminal attrs are reset before drawing status elements (avoids leaked injected BG)
+        try:
+            cy, cx = self.stdscr.getyx()
+            sys.stdout.write("\x1b[0m\x1b[39;49m")
+            sys.stdout.write(f"\x1b[{cy+1};{cx+1}H")
+            sys.stdout.flush()
+        except Exception:
+            pass
         
         if self.realmaxX >= self.appState.full_ui_width:    # Wide big window
             self.appState.narrowWindow = False
@@ -2416,13 +2444,27 @@ class UserInterface():  # Separate view (curses) from this controller
         # Draw FG and BG colors
         if self.appState.colorMode == "256":
             self.addstr(statusBarLineNum+1, 0, "FG:", curses.color_pair(clickColor) | curses.A_BOLD)
-            cp = self.ansi.colorPairMap[(self.colorfg, 0)]
+            cp = self.ansi.colorPairMap.get((self.colorfg, 0), 0)
             self.addstr(statusBarLineNum+1, 3, self.appState.colorPickChar * 2, curses.color_pair(cp))
-        if self.appState.showBgColorPicker:
-            self.addstr(statusBarLineNum+1, 6, "BG:", curses.color_pair(clickColor) | curses.A_BOLD)
-            cp = self.ansi.colorPairMap[(1, self.colorbg)]
-            fillChar = ' '
+        if self.appState.showBgColorPicker or self.appState.bg_inject_enabled:
+            # Force black background for status labels to avoid leak
+            safe_bg_attr = curses.color_pair(self.ansi.colorPairMap.get((clickColor, 0), clickColor))
+            self.addstr(statusBarLineNum+1, 6, "BG:", safe_bg_attr | curses.A_BOLD)
+            # Use a safe color pair for swatch if curses lacks it
+            cp = self.ansi.colorPairMap.get((1, self.colorbg), 0)
+            fillChar = 'B'
             self.addstr(statusBarLineNum+1, 9, fillChar * 2, curses.color_pair(cp))
+            if self.appState.colorMode == "256" and (self.appState.bg_inject_enabled or self.appState.can_inject):
+                # overlay with ANSI but reset bg afterward
+                moveCode = f"\x1b[{statusBarLineNum+2};{10}H"
+                colorCode = self.ansi.getColorCode256(self.colorfg, self.colorbg)
+                sys.stdout.write(moveCode)
+                sys.stdout.write(colorCode)
+                sys.stdout.write("  ")
+                sys.stdout.write("\x1b[0m\x1b[39;49m")
+                cy, cx = self.stdscr.getyx()
+                sys.stdout.write(f"\x1b[{cy+1};{cx+1}H")
+                sys.stdout.flush()
 
         # Draw character map for f1-f10 (block characters)
         self.addstr(statusBarLineNum+1, self.chMap_offset-1, "<", curses.color_pair(clickColor) | curses.A_BOLD)
@@ -2989,11 +3031,13 @@ class UserInterface():  # Separate view (curses) from this controller
                 self.deleteKeyPop()
             elif c in [383]:              # shift-delete - delete from opposite direction
                 self.reverseDelete()
-            elif c in [9, 353]:     # 9 = tab, 353 = shift-tab
-                #if self.appState.colorMode == "256":
-                    #self.statusBar.colorPickerButton.on_click()
-                    #self.selectColorPicker()
+            elif c == 9:     # tab -> fg picker
                 self.selectColorPicker()
+            elif c == 353:   # shift-tab -> bg picker if available
+                if self.appState.colorMode == "256" and (self.appState.bg_inject_enabled or self.appState.can_inject):
+                    self.selectBgColorPicker()
+                else:
+                    self.selectColorPicker()
             elif c in [339, curses.KEY_PPAGE]:  # page up
                 self.move_cursor_pgup()
             elif c in [338, curses.KEY_NPAGE]:  # page down
@@ -3416,6 +3460,17 @@ class UserInterface():  # Separate view (curses) from this controller
         color = self.statusBar.colorPicker.showFgPicker(message=message)
         #if self.appState.colorMode == "16":
         #    self.statusBar.colorPicker_bg_16.showFgPicker()
+        self.appState.colorPickerSelected = False
+        return color
+
+    def selectBgColorPicker(self, message=None):
+        if self.appState.colorMode != "256":
+            return False
+        self.appState.bg_inject_enabled = True
+        self.appState.can_inject = True
+        self.appState.showBgColorPicker = True
+        self.appState.colorPickerSelected = True
+        color = self.statusBar.colorPicker.showBgPicker(message=message)
         self.appState.colorPickerSelected = False
         return color
 
@@ -5509,7 +5564,7 @@ class UserInterface():  # Separate view (curses) from this controller
                         self.loadFromFile(shortfile, 'ascii')
                 # If drawing does contain high colors, and backgrounds... remove the backgrounds until 256 bg colors works.
                 if self.mov.contains_high_colors():
-                    if self.mov.contains_background_colors():
+                    if self.mov.contains_background_colors() and not (self.appState.bg_inject_enabled or self.appState.can_inject):
                         self.mov.strip_backgrounds()
             self.hardRefresh()
 
@@ -5590,7 +5645,7 @@ class UserInterface():  # Separate view (curses) from this controller
                 #self.appState.fileLongPath = fullpath
 
                 if self.appState.colorMode == "256":
-                    if self.mov.contains_background_colors():
+                    if self.mov.contains_background_colors() and not (self.appState.bg_inject_enabled or self.appState.can_inject):
                         self.mov.strip_backgrounds()
 
                 # Remove un-printable characters, eg: errant \n from old .dur files, where enter accidentally inserted ^Ms.
@@ -5988,7 +6043,7 @@ class UserInterface():  # Separate view (curses) from this controller
                         colorFg = color[0]
                         colorBg = color[1]
                         if self.appState.colorMode == "256":
-                            if self.appState.showBgColorPicker == False:
+                            if self.appState.showBgColorPicker == False and not (self.appState.bg_inject_enabled or self.appState.can_inject):
                                 colorBg = 0 # black, I hope
                         try:
                             if ircColors:
@@ -6067,7 +6122,7 @@ class UserInterface():  # Separate view (curses) from this controller
                 colorFg = color[0]
                 colorBg = color[1]
                 if self.appState.colorMode == "256":
-                    if self.appState.showBgColorPicker == False:
+                    if self.appState.showBgColorPicker == False and not (self.appState.bg_inject_enabled or self.appState.can_inject):
                         colorBg = 0 # black, I hope
                 try:
                     if ircColors:
@@ -6455,6 +6510,7 @@ Can use ESC or META instead of ALT
         screenLineNum = 0
         firstCol = self.appState.firstCol
         lastCol = min(mov.sizeX, self.appState.realmaxX + firstCol)
+        inject_cells = []
         # Draw each character
         for linenum in range(topLine, lastLineToDraw):
             line = mov.currentFrame.content[linenum]
@@ -6495,22 +6551,15 @@ Can use ESC or META instead of ALT
                 except: # Or if we can't, fail to the terminal's default color
                     cursesColorPair = 0
                 injecting = False
-                if self.appState.can_inject and self.appState.colorMode == "256":
+                if self.appState.colorMode == "256" and (self.appState.can_inject or self.appState.bg_inject_enabled):
                     injecting = True
                 if charColor[0] > 8 and charColor[0] <= 16 and self.appState.colorMode == "16":    # bright color
                     self.addstr(screenLineNum + line_offset, colnum - self.appState.firstCol + col_offset, charContent, curses.color_pair(cursesColorPair) | curses.A_BOLD)
                 elif charColor[0] > 7 and charColor[0] <= 15 and self.appState.colorMode == "256":    # bright color
                     # Let's try injecting!
-                    if injecting:
-                        moveCode = f"\x1b[{screenLineNum + 1};{colnum - self.appState.firstCol + 1}H"
-                        colorCode = self.ansi.getColorCode256(charColor[0],charColor[1])
-                        sys.stdout.write(moveCode)
-                        sys.stdout.write(colorCode)
-                        sys.stdout.write(charContent)
-                        pass
-                        #self.addstr(screenLineNum, colnum - self.appState.firstCol, charContent)
-                    else:
-                        self.addstr(screenLineNum + line_offset, colnum - self.appState.firstCol + col_offset, charContent, curses.color_pair(cursesColorPair) | curses.A_BOLD)
+                    if injecting and charColor[1] != 0:
+                        inject_cells.append((screenLineNum + line_offset, colnum - self.appState.firstCol + col_offset, charContent, charColor))
+                    self.addstr(screenLineNum + line_offset, colnum - self.appState.firstCol + col_offset, charContent, curses.color_pair(cursesColorPair) | curses.A_BOLD)
                 # If the mouse cursor is over Fg: 1 Bg:1 in 16 color mode, aka Black on Black
                 # then print with defualt charaacters instead. This should prevent the cursor from
                 # disappearing, as well as let you preview "invisible" text under the cursor.
@@ -6529,27 +6578,9 @@ Can use ESC or META instead of ALT
                     else:   # 256 color Normal character, under the cursor. No funny business. Print to the screen
                         self.addstr(screenLineNum, colnum - self.appState.firstCol, charContent, curses.color_pair(cursesColorPair))
                 else:   # Normal character. No funny business. Print to the screen
-                    #injecting = True
                     if injecting and charColor[1] != 0:
-                        #self.stdscr.move(screenLineNum, colnum - self.appState.firstCol)
-                        #self.stdscr.refresh()
-                        moveCode = f"\x1b[{screenLineNum + 1};{colnum - self.appState.firstCol + 1}H"
-                        colorCode = self.ansi.getColorCode256(charColor[0],charColor[1])
-                        #sys.stdout.write(f"\x1b[38:5:{charColor[0]}m")   # FG
-                        sys.stdout.write(moveCode)
-                        sys.stdout.write(colorCode)
-                        #sys.stdout.write(f"\x1b[48:5:{charColor[1]}m")   # BG
-                        sys.stdout.write(charContent)
-                        #time.sleep(0.001)
-                        #self.stdscr.refresh()
-                        #self.notify("Injected", wait_time=40)
-                        #sys.stdout.write("\x1b[48:5:46m")
-                        #sys.stdout.write("\x1b[38:5:19m")
-                        #self.addstr(screenLineNum, colnum - self.appState.firstCol, f"{charContent}")
-                        pass
-                        #self.addstr(screenLineNum, colnum - self.appState.firstCol, charContent)
-                    else:
-                        self.addstr(screenLineNum + line_offset, colnum - self.appState.firstCol + col_offset, charContent, curses.color_pair(cursesColorPair))
+                        inject_cells.append((screenLineNum + line_offset, colnum - self.appState.firstCol + col_offset, charContent, charColor))
+                    self.addstr(screenLineNum + line_offset, colnum - self.appState.firstCol + col_offset, charContent, curses.color_pair(cursesColorPair))
             # draw border on right edge of line
             if not preview and self.appState.drawBorders and screenLineNum + topLine < self.mov.sizeY:
                 self.addstr(screenLineNum, mov.sizeX, ": ", curses.color_pair(self.appState.theme['borderColor']))
@@ -6572,8 +6603,20 @@ Can use ESC or META instead of ALT
             curses.panel.update_panels()
         if self.appState.playingHelpScreen:
             self.addstr(self.statusBarLineNum + 1, 0, "Up/Down, Pgup/Pgdown, Home/End or Mouse Wheel to scroll. Enter or Esc to exit.", curses.color_pair(self.appState.theme['promptColor']))
-        if refreshScreen:
+        if refreshScreen or inject_cells:
             self.stdscr.refresh()
+            if inject_cells:
+                for (y, x, ch, cc) in inject_cells:
+                    moveCode = f"\x1b[{y + 1};{x + 1}H"
+                    colorCode = self.ansi.getColorCode256(cc[0], cc[1])
+                    sys.stdout.write(moveCode)
+                    sys.stdout.write(colorCode)
+                    sys.stdout.write(ch)
+                # reset attrs and return cursor to where curses thinks it is
+                cy, cx = self.stdscr.getyx()
+                sys.stdout.write("\x1b[0m\x1b[39;49m")
+                sys.stdout.write(f"\x1b[{cy+1};{cx+1}H")
+                sys.stdout.flush()
 
     def addColToCanvas(self):
         self.undo.push()    # window is big enough
